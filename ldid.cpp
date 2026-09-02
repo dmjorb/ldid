@@ -2882,16 +2882,41 @@ struct RuleCode {
 
 #ifndef LDID_NOPLIST
 static Hash Sign(const uint8_t *prefix, size_t size, std::streambuf &buffer, Hash &hash, std::streambuf &save, const std::string &identifier, const std::string &entitlements, bool merge, const std::string &requirements, const std::string &key, const Slots &slots, size_t length, uint32_t flags, bool platform, const Progress &progress) {
-    // XXX: this is a miserable fail
-    std::stringbuf temp;
-    put(temp, prefix, size);
-    copy(buffer, temp, length - size, progress);
-    // XXX: this is a stupid hack
-    pad(temp, 0x10 - (length & 0xf));
-    auto data(temp.str());
+    // Stream to temp file + mmap instead of loading whole binary into RAM.
+    // Original code copied the entire file twice into std::stringbuf/std::string,
+    // which jetsams / asserts on large binaries (WeChat main executable ~400MB).
+    size_t padded((length + 0xf) & ~size_t(0xf));
+
+    char tmpl[1024];
+    const char *tmpdir(getenv("TMPDIR"));
+    snprintf(tmpl, sizeof(tmpl), "%sldid_sign_XXXXXX", tmpdir ? tmpdir : "/tmp/");
+    int fd(mkstemp(tmpl));
+    _assert(fd >= 0);
+
+    write(fd, prefix, size);
+    char chunk[65536];
+    for (size_t remaining(length - size); remaining > 0;) {
+        size_t want(std::min(remaining, sizeof(chunk)));
+        std::streamsize got(buffer.sgetn(chunk, want));
+        if (got <= 0) break;
+        write(fd, chunk, got);
+        remaining -= got;
+    }
+    if (padded > length) {
+        char zeros[0x10] = {};
+        write(fd, zeros, padded - length);
+    }
+
+    void *data(mmap(NULL, padded, PROT_READ, MAP_PRIVATE, fd, 0));
+    close(fd);
+    _assert(data != MAP_FAILED);
 
     HashProxy proxy(hash, save);
-    return Sign(data.data(), data.size(), proxy, identifier, entitlements, merge, requirements, key, slots, flags, platform, progress);
+    Hash result(Sign(data, padded, proxy, identifier, entitlements, merge, requirements, key, slots, flags, platform, progress));
+
+    munmap(data, padded);
+    unlink(tmpl);
+    return result;
 }
 
 struct State {
