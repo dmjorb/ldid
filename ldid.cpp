@@ -2907,7 +2907,7 @@ static Hash Sign(const uint8_t *prefix, size_t size, std::streambuf &buffer, Has
         write(fd, zeros, padded - length);
     }
 
-    void *data(mmap(NULL, padded, PROT_READ, MAP_PRIVATE, fd, 0));
+    void *data(mmap(NULL, padded, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0));
     close(fd);
     _assert(data != MAP_FAILED);
 
@@ -2966,13 +2966,32 @@ Bundle Sign(const std::string &root, Folder &parent, const std::string &key, Sta
 
     std::string entitlements;
     folder.Open(executable, fun([&](std::streambuf &buffer, size_t length, const void *flag) {
-        // XXX: this is a miserable fail
-        std::stringbuf temp;
-        copy(buffer, temp, length, progress);
-        // XXX: this is a stupid hack
-        pad(temp, 0x10 - (length & 0xf));
-        auto data(temp.str());
-        entitlements = alter(root, Analyze(data.data(), data.size()));
+        // Stream to temp file + mmap instead of loading whole executable into RAM
+        // just to extract entitlements from Mach-O load commands.
+        size_t padded((length + 0xf) & ~size_t(0xf));
+        char tmpl[1024];
+        const char *tmpdir(getenv("TMPDIR"));
+        snprintf(tmpl, sizeof(tmpl), "%sldid_ent_XXXXXX", tmpdir ? tmpdir : "/tmp/");
+        int fd(mkstemp(tmpl));
+        _assert(fd >= 0);
+        char chunk[65536];
+        for (size_t remaining(length); remaining > 0;) {
+            size_t want(std::min(remaining, sizeof(chunk)));
+            std::streamsize got(buffer.sgetn(chunk, want));
+            if (got <= 0) break;
+            write(fd, chunk, got);
+            remaining -= got;
+        }
+        if (padded > length) {
+            char zeros[0x10] = {};
+            write(fd, zeros, padded - length);
+        }
+        void *mapped(mmap(NULL, padded, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0));
+        close(fd);
+        _assert(mapped != MAP_FAILED);
+        entitlements = alter(root, Analyze(mapped, padded));
+        munmap(mapped, padded);
+        unlink(tmpl);
     }));
 
     static const std::string directory("_CodeSignature/");
