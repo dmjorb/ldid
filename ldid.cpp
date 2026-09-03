@@ -535,8 +535,15 @@ static inline void put(std::streambuf &stream, const void *data, size_t size, co
     progress(0);
     for (size_t total(0); total != size;) {
         auto writ(std::min(size - total, size_t(4096 * 4)));
-        _assert(stream.sputn(static_cast<const char *>(data) + total, writ) == writ);
-        total += writ;
+        // std::filebuf::sputn may return a short write on iOS (esp. large files).
+        // Loop until all bytes are written instead of asserting on partial writes.
+        std::streamsize written(stream.sputn(static_cast<const char *>(data) + total, writ));
+        if (written <= 0) {
+            int e(errno);
+            _assert_(false, "put: sputn failed after %zu/%zu bytes (errno=%d: %s)",
+                     total, size, e, strerror(e));
+        }
+        total += static_cast<size_t>(written);
         progress(double(total) / size);
     }
 }
@@ -2910,12 +2917,14 @@ static Hash Sign(const uint8_t *prefix, size_t size, std::streambuf &buffer, Has
     void *data(mmap(NULL, padded, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0));
     close(fd);
     _assert(data != MAP_FAILED);
+    // Unlink immediately: mmap keeps the inode alive until munmap,
+    // but the directory entry is gone so it cannot linger on crash.
+    unlink(tmpl);
 
     HashProxy proxy(hash, save);
     Hash result(Sign(data, padded, proxy, identifier, entitlements, merge, requirements, key, slots, flags, platform, progress));
 
     munmap(data, padded);
-    unlink(tmpl);
     return result;
 }
 
@@ -2989,9 +2998,9 @@ Bundle Sign(const std::string &root, Folder &parent, const std::string &key, Sta
         void *mapped(mmap(NULL, padded, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0));
         close(fd);
         _assert(mapped != MAP_FAILED);
+        unlink(tmpl);
         entitlements = alter(root, Analyze(mapped, padded));
         munmap(mapped, padded);
-        unlink(tmpl);
     }));
 
     static const std::string directory("_CodeSignature/");
